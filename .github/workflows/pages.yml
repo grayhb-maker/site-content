@@ -1,22 +1,98 @@
-name: Deploy Pages
+name: Deploy encrypted Pages
 
 on:
   push:
     branches:
       - main
+    paths:
+      - encrypted/site.tar.gz.enc
+      - .github/workflows/pages.yml
   workflow_dispatch:
 
 permissions:
   contents: read
   pages: write
   id-token: write
+  actions: write
 
 concurrency:
   group: github-pages
   cancel-in-progress: true
 
 jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact_id }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Decrypt and validate site
+        env:
+          SITE_ARCHIVE_KEY: ${{ secrets.SITE_ARCHIVE_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          test -n "${SITE_ARCHIVE_KEY}"
+          test -s encrypted/site.tar.gz.enc
+
+          rm -rf _site
+          mkdir -m 700 _site
+
+          openssl enc \
+            -d \
+            -aes-256-cbc \
+            -pbkdf2 \
+            -iter 200000 \
+            -md sha256 \
+            -in encrypted/site.tar.gz.enc \
+            -out /tmp/site.tar.gz \
+            -pass env:SITE_ARCHIVE_KEY
+
+          python3 <<'PY'
+          import pathlib
+          import tarfile
+
+          archive = pathlib.Path("/tmp/site.tar.gz")
+          target = pathlib.Path("_site").resolve()
+
+          with tarfile.open(archive, "r:gz") as source:
+              members = source.getmembers()
+
+              if not members:
+                  raise SystemExit("Archive is empty")
+
+              for member in members:
+                  if not (member.isfile() or member.isdir()):
+                      raise SystemExit(f"Unsupported archive entry: {member.name}")
+
+                  destination = (target / member.name).resolve()
+
+                  if destination != target and target not in destination.parents:
+                      raise SystemExit(f"Unsafe archive path: {member.name}")
+
+              source.extractall(target, members=members)
+          PY
+
+          rm -f /tmp/site.tar.gz
+          test -s _site/index.html
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload temporary Pages artifact
+        id: upload
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+          retention-days: 1
+
   deploy:
+    needs: build
     runs-on: ubuntu-latest
 
     environment:
@@ -24,17 +100,27 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload site
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: site
-
-      - name: Deploy site
+      - name: Deploy GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+  cleanup:
+    needs:
+      - build
+      - deploy
+
+    if: always() && needs.build.outputs.artifact_id != ''
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Delete temporary Pages artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          gh api \
+            --method DELETE \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}"
