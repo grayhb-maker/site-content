@@ -79,7 +79,8 @@ jobs:
           PY
 
           rm -f /tmp/site.tar.gz
-          test -s _site/index.html
+          test -s _site/404.html
+          test ! -e _site/index.html
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
